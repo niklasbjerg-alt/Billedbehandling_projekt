@@ -1,0 +1,156 @@
+# King Domino - finder scoren for en plade
+# bruger: slicing, HSV, template matching og grassfire fra forelæsningerne
+import cv2, numpy as np, os, sys
+
+ROWS, COLS = 5, 5
+folder = os.path.dirname(os.path.abspath(__file__))
+
+# hsv grænser for hvert terræn (median af feltet). lavet ud fra træningspladerne
+# rækkefølgen betyder noget, den første der passer bliver brugt
+TERRAINS = [
+    ("Lake",      (95, 150,  90), (130, 255, 255)),  # blå
+    ("Field",     (22, 200, 100), (30, 255, 255)),   # gul
+    ("Grassland", (32, 150,  80), (60, 255, 255)),   # lysegrøn
+    ("Forest",    (27,  60,  25), (85, 255,  79)),   # mørkegrøn
+    ("Mine",      (15,  30,  15), (27, 160,  72)),   # mørk
+    ("Empty",     (15, 185, 115), (21, 230, 190)),   # bordet (ingen brik)
+    ("Swamp",     (15,  20,  73), (27, 185, 150)),   # brun/grå
+]
+# passer et felt ikke på noget bliver det "Unknown" (det er som regel hjemmefeltet)
+
+CROWN_THRESHOLD = 0.5   # min. score fra template matching for at det er en krone
+
+
+# opdel billedet i 5x5 felter
+def get_tiles(image):
+    h, w = image.shape[:2]
+    tiles = []
+    for r in range(ROWS):
+        row = []
+        for c in range(COLS):
+            row.append(image[r * h // ROWS:(r + 1) * h // ROWS, c * w // COLS:(c + 1) * w // COLS])
+        tiles.append(row)
+    return tiles
+
+
+# find terræn ud fra medianfarven i hsv
+def get_terrain(tile):
+    hsv = cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
+    h, s, v = np.median(hsv.reshape(-1, 3), axis=0)   # median så kroner og huse ikke trækker for meget (HVAD ER -1, 3?)
+    for name, lower, upper in TERRAINS:
+        if lower[0] <= h <= upper[0] and lower[1] <= s <= upper[1] and lower[2] <= v <= upper[2]:
+            return name
+    return "Unknown"
+
+
+# grassfire med 4-nabolag. bruges både på felterne og på kronerne
+# stacks i stedet for rekursion
+# Vi opsætter stacks ud fra om en grid er burned eller ej, herudfra checker den, den stack (y, x) der er på og ser om
+# Vi har nabooer op, ned, venstre og højre er samme blobs. Derfra brændes de grids, hvor Vi fortsætter med stack koden indtil alle er brændt.
+# til sidst returned blob.
+def grassfire(grid, y, x, burned):
+    value = grid[y][x]
+    stack = [(y, x)]
+    burned[y][x] = True
+    blob = []
+    while stack:
+        y, x = stack.pop()
+        blob.append((y, x))
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < len(grid) and 0 <= nx < len(grid[0]) and not burned[ny][nx] and grid[ny][nx] == value: #Len(grid[0])???
+                burned[ny][nx] = True
+                stack.append((ny, nx))
+    return blob
+
+
+# find de sammenhængende områder af samme terræn
+def find_regions(terrain):
+    burned = [[False] * COLS for _ in range(ROWS)]
+    regions = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            if not burned[r][c] and terrain[r][c] not in ("Home", "Unknown", "Empty"):
+                regions.append((terrain[r][c], grassfire(terrain, r, c, burned)))
+    return regions
+
+
+# maske til kronen: kun den hvide kant og den gule midte, så baggrunden ikke tæller med
+def crown_mask(template):
+    hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, (0, 0, 95), (179, 90, 255))
+    yellow = cv2.inRange(hsv, (20, 120, 100), (35, 255, 255))
+    return cv2.bitwise_or(white, yellow)
+
+
+# find kroner med template matching i alle 4 rotationer
+def find_crowns(image, template):
+    padded = cv2.copyMakeBorder(image, 15, 15, 15, 15, cv2.BORDER_REPLICATE)   # kant, så kroner ved kanten også findes
+    mask = crown_mask(template)
+
+    best = np.zeros(padded.shape[:2], dtype=np.float32)   # bedste score for hver pixel
+    for rot in (None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+        t = template if rot is None else cv2.rotate(template, rot)
+        m = mask if rot is None else cv2.rotate(mask, rot)
+        th, tw = t.shape[:2]
+        result = cv2.matchTemplate(padded, t, cv2.TM_CCOEFF_NORMED, mask=m)
+        rh, rw = result.shape
+        centre = best[th // 2:th // 2 + rh, tw // 2:tw // 2 + rw]   # flyt fra hjørne til midten af kronen
+        np.maximum(centre, result, out=centre)
+
+    # threshold og så er hver klat én krone
+    binary = (best >= CROWN_THRESHOLD).astype(np.uint8)
+    burned = np.zeros(binary.shape, dtype=bool)
+    crowns = []
+    for y, x in zip(*np.nonzero(binary)):
+        if not burned[y, x]:
+            blob = grassfire(binary, y, x, burned)
+            cy = sum(p[0] for p in blob) / len(blob) - 15   # midtpunkt af klatten (minus kanten)
+            cx = sum(p[1] for p in blob) / len(blob) - 15
+            crowns.append((cx, cy))
+    return crowns, best[15:-15, 15:-15]
+
+
+# antal kroner i hvert felt
+def count_crowns(crowns, terrain, shape):
+    h, w = shape[:2]
+    counts = np.zeros((ROWS, COLS), dtype=int)
+    for x, y in crowns:
+        r = min(max(int(y * ROWS / h), 0), ROWS - 1)
+        c = min(max(int(x * COLS / w), 0), COLS - 1)
+        if terrain[r][c] != "Home":   # ingen kroner på hjem
+            counts[r, c] += 1
+    return counts
+
+
+# score = felter i området * kroner i området
+def calculate_score(regions, crown_counts):
+    total = 0
+    for terrain, tiles in regions:
+        total += len(tiles) * sum(crown_counts[y, x] for y, x in tiles)
+    return total
+
+
+def analyse(path, template):
+    image = cv2.imread(path)
+    if image is None:
+        raise FileNotFoundError(path)
+    terrain = [[get_terrain(tile) for tile in row] for row in get_tiles(image)]
+    regions = find_regions(terrain)
+    crowns, _ = find_crowns(image, template)
+    counts = count_crowns(crowns, terrain, image.shape)
+    return terrain, regions, counts, calculate_score(regions, counts)
+
+# Udvalgælse af billeder og templates
+if __name__ == "__main__":
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(folder, "kingdomino.jpg")
+    template = cv2.imread(os.path.join(folder, "crown_template.png"))
+    terrain, regions, counts, score = analyse(path, template)
+    for row in terrain:
+        print(" ".join(f"{t:>9}" for t in row))
+    print("\nCrowns per tile:\n", counts)
+    print("\nRegions:")
+    for terrain_name, tiles in regions:
+        crowns = sum(counts[y, x] for y, x in tiles)
+        if crowns:
+            print(f"  {terrain_name:<9} {len(tiles)} tiles x {crowns} crowns = {len(tiles) * crowns}")
+    print("\nScore:", score)
