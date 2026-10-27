@@ -1,5 +1,3 @@
-# King Domino - finder scoren for en plade
-# bruger: slicing, HSV, template matching og grassfire fra forelæsningerne
 import cv2, numpy as np, os, sys
 
 ROWS, COLS = 5, 5
